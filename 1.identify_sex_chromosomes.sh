@@ -41,6 +41,9 @@ if [[ ! -s ${FILELIST} ]]; then
     exit 1
 fi
 
+# Silence the "New version of client available" notice datasets prints on every call
+datasets() { command datasets "$@" 2> >(grep -v 'New version of client' >&2); }
+
 # Top-level directory of each key = assembly accession
 ACCESSIONS=$(cut -f2 ${FILELIST} | cut -d/ -f1 | grep -E '^GC[AF]_[0-9]+\.[0-9]+$' | sort -u)
 echo "Found $(wc -w <<< "${ACCESSIONS}") accessions in ${FILELIST}"
