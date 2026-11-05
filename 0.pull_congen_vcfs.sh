@@ -1,34 +1,37 @@
 #!/bin/bash
 #SBATCH --job-name=pull_congen_vcfs
 #SBATCH --partition=norm
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8g
-#SBATCH --time=24:00:00
-#SBATCH --output=pull_congen_vcfs.%j.out
-#SBATCH --error=pull_congen_vcfs.%j.err
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=4g
+#SBATCH --time=12:00:00
+#SBATCH --output=pull_congen_vcfs.%A_%a.out
+#SBATCH --error=pull_congen_vcfs.%A_%a.err
 
 # Pull the VGP ConGen Phase 1 variant-calling outputs from GenomeArk (public S3)
-# into the Wilson Lab data directory on Biowulf.
+# into the Wilson Lab data directory on Biowulf, one file per array task.
 #
-# Usage:
-#   sbatch pull_congen_vcfs.sh            # run as a batch job (recommended)
-#   bash pull_congen_vcfs.sh              # or run interactively on helix
-#   bash pull_congen_vcfs.sh --dryrun     # list what would be transferred, no download
+# Step 1 - build the file list (no SLURM needed; run on helix or a login node):
+#   bash ${SCRIPTDIR}/0.pull_congen_vcfs.sh list
 #
-# aws s3 sync is resumable: re-running only fetches missing/changed files.
+# Step 2 - submit one array task per file (%20 caps concurrent downloads at 20):
+#   N=$(wc -l < ${DATADIR}/vcfs/s3_filelist.txt)
+#   sbatch --array=1-${N}%20 ${SCRIPTDIR}/0.pull_congen_vcfs.sh
+#
+# Each task skips its file if it already exists with the correct size, so the
+# array can be resubmitted to pick up any failures.
 
 set -euo pipefail
 
+PROJDIR=/data/Wilson_Lab/projects/ConGen_VGP_Phase1
 DATADIR=/data/Wilson_Lab/data/ConGen_VGP_Phase1
-OUTDIR=$DATADIR/vcfs
+GITDIR=${PROJDIR}/scripts/
+SCRIPTDIR=${PROJDIR}/scripts/SexChr_ConGen_VGP_Phase1
+
+OUTDIR=${DATADIR}/vcfs
+FILELIST=${OUTDIR}/s3_filelist.txt
 
 BUCKET=s3://genomeark
 PREFIX=downstream_analyses/conservation_genomics/variant_calling/
-
-DRYRUN=""
-if [[ "${1:-}" == "--dryrun" ]]; then
-    DRYRUN="--dryrun"
-fi
 
 # Biowulf provides the AWS CLI as a module
 module load aws 2>/dev/null || module load awscli 2>/dev/null || {
@@ -36,24 +39,81 @@ module load aws 2>/dev/null || module load awscli 2>/dev/null || {
     exit 1
 }
 
-mkdir -p "$OUTDIR"
+mkdir -p ${OUTDIR}
 
-echo "Source:      $BUCKET/$PREFIX"
-echo "Destination: $OUTDIR"
+#---------------------------------------------------------------------------
+# Mode 1: build the file list
+#---------------------------------------------------------------------------
+if [[ "${1:-}" == "list" ]]; then
+    echo "Listing ${BUCKET}/${PREFIX}"
+
+    # Full listing (date, time, size, key) kept for reference
+    aws s3 ls --no-sign-request --recursive --human-readable --summarize \
+        ${BUCKET}/${PREFIX} > ${OUTDIR}/s3_listing.txt
+
+    # Two tab-separated columns: size in bytes, key relative to ${PREFIX}
+    aws s3 ls --no-sign-request --recursive ${BUCKET}/${PREFIX} \
+        | awk -v prefix="${PREFIX}" '
+            $3 > 0 {
+                size = $3
+                key  = $0
+                sub(/^ *[^ ]+ +[^ ]+ +[^ ]+ +/, "", key)   # strip date, time, size
+                sub("^" prefix, "", key)
+                print size "\t" key
+            }' > ${FILELIST}
+
+    N=$(wc -l < ${FILELIST})
+    echo "Wrote ${N} files to ${FILELIST}"
+    echo
+    echo "Submit with:"
+    echo "  sbatch --array=1-${N}%20 ${SCRIPTDIR}/0.pull_congen_vcfs.sh"
+    exit 0
+fi
+
+#---------------------------------------------------------------------------
+# Mode 2: array task - download one file
+#---------------------------------------------------------------------------
+if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    echo "ERROR: run with 'list' first, then submit as a SLURM array (see header)." >&2
+    exit 1
+fi
+
+if [[ ! -s ${FILELIST} ]]; then
+    echo "ERROR: ${FILELIST} not found. Run 'bash 0.pull_congen_vcfs.sh list' first." >&2
+    exit 1
+fi
+
+LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" ${FILELIST})
+if [[ -z "${LINE}" ]]; then
+    echo "ERROR: no entry at line ${SLURM_ARRAY_TASK_ID} of ${FILELIST}" >&2
+    exit 1
+fi
+
+SIZE=$(cut -f1 <<< "${LINE}")
+KEY=$(cut -f2- <<< "${LINE}")
+SRC=${BUCKET}/${PREFIX}${KEY}
+DEST=${OUTDIR}/${KEY}
+
+echo "Task:        ${SLURM_ARRAY_TASK_ID}"
+echo "Source:      ${SRC}"
+echo "Destination: ${DEST}"
+echo "Size:        ${SIZE} bytes"
 echo "Started:     $(date)"
-echo
 
-# Show what is in the bucket prefix before transferring
-aws s3 ls --no-sign-request --recursive --human-readable --summarize "$BUCKET/$PREFIX" \
-    | tee "$OUTDIR/s3_listing.txt"
-echo
+# Skip if already complete
+if [[ -f ${DEST} && $(stat -c %s ${DEST}) -eq ${SIZE} ]]; then
+    echo "Already downloaded, skipping."
+    exit 0
+fi
 
-# Mirror the prefix (including subdirectories) into $OUTDIR
-aws s3 sync --no-sign-request --no-progress $DRYRUN \
-    "$BUCKET/$PREFIX" "$OUTDIR/"
+mkdir -p $(dirname ${DEST})
 
-echo
+aws s3 cp --no-sign-request --no-progress ${SRC} ${DEST}
+
+# Verify size
+if [[ $(stat -c %s ${DEST}) -ne ${SIZE} ]]; then
+    echo "ERROR: size mismatch for ${DEST} (expected ${SIZE}, got $(stat -c %s ${DEST}))" >&2
+    exit 1
+fi
+
 echo "Finished:    $(date)"
-echo "Files in $OUTDIR:"
-find "$OUTDIR" -type f | wc -l
-du -sh "$OUTDIR"
