@@ -56,7 +56,8 @@ for ACC in ${ACCESSIONS}; do
     #-- genome report: species, tax_id, biosample sex ----------------------
     GENOME_JSON=${TMPDIR}/${ACC}.genome.json
     if [[ ! -s ${GENOME_JSON} ]]; then
-        datasets summary genome accession ${ACC} --as-json-lines > ${GENOME_JSON}
+        datasets summary genome accession ${ACC} --as-json-lines > ${GENOME_JSON} \
+            || { echo "WARNING: genome report failed for ${ACC}, skipping" >&2; rm -f ${GENOME_JSON}; continue; }
     fi
 
     SPECIES=$(jq -r '.organism.organism_name // "NA"' ${GENOME_JSON})
@@ -72,27 +73,35 @@ for ACC in ${ACCESSIONS}; do
     if [[ -n "${TAXID}" ]]; then
         TAX_JSON=${TMPDIR}/${ACC}.taxonomy.json
         if [[ ! -s ${TAX_JSON} ]]; then
-            datasets summary taxonomy taxon ${TAXID} --as-json-lines > ${TAX_JSON}
+            datasets summary taxonomy taxon ${TAXID} --as-json-lines > ${TAX_JSON} \
+                || { echo "WARNING: taxonomy report failed for ${ACC} (taxid ${TAXID})" >&2; rm -f ${TAX_JSON}; }
         fi
-        CLASS=$(jq -r '.taxonomy.classification.class.name // "NA"' ${TAX_JSON})
-        ORDER=$(jq -r '.taxonomy.classification.order.name // "NA"' ${TAX_JSON})
+        if [[ -s ${TAX_JSON} ]]; then
+            CLASS=$(jq -r '.taxonomy.classification.class.name // "NA"' ${TAX_JSON})
+            ORDER=$(jq -r '.taxonomy.classification.order.name // "NA"' ${TAX_JSON})
+        fi
     fi
 
     #-- sequence report: chromosome names ----------------------------------
     SEQ_JSON=${TMPDIR}/${ACC}.sequences.json
     if [[ ! -s ${SEQ_JSON} ]]; then
-        datasets summary genome accession ${ACC} --report sequence --as-json-lines > ${SEQ_JSON}
+        datasets summary genome accession ${ACC} --report sequence --as-json-lines > ${SEQ_JSON} \
+            || { echo "WARNING: sequence report failed for ${ACC}" >&2; rm -f ${SEQ_JSON}; }
     fi
 
-    CHROMS=$(jq -r '
-        select(.assigned_molecule_location_type == "Chromosome"
-               and .role == "assembled-molecule")
-        | .chr_name' ${SEQ_JSON} | sort -u)
+    CHROMS=""
+    if [[ -s ${SEQ_JSON} ]]; then
+        CHROMS=$(jq -r '
+            select(.assigned_molecule_location_type == "Chromosome"
+                   and .role == "assembled-molecule")
+            | .chr_name' ${SEQ_JSON} | sort -u)
+    fi
 
     if [[ -z "${CHROMS}" ]]; then
         SEXCHR=no_chromosomes
     else
-        SEXCHR=$(grep -Ei '^(chr)?[XYZW][0-9]*$' <<< "${CHROMS}" | sed -E 's/^chr//I' | sort -u | paste -sd, -)
+        # grep exits 1 on no match, which would trip set -e; the || true keeps us going
+        SEXCHR=$( { grep -Ei '^(chr)?[XYZW][0-9]*$' <<< "${CHROMS}" || true; } | sed -E 's/^chr//I' | sort -u | paste -sd, -)
         SEXCHR=${SEXCHR:-none}
     fi
 
